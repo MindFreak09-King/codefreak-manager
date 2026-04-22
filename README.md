@@ -14,7 +14,7 @@ Simple SSH Manager for VPS with expiry system.
 ## Installation
 
 ```bash
-git clone https://github.com/YOURUSERNAME/codefreak-manager.git
+git clone https://github.com/MindFreak09-King/codefreak-manager.git
 cd codefreak-manager
 chmod +x install-codefreak.sh
 sudo ./install-codefreak.sh
