@@ -1,0 +1,425 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="CodeFreak SSH Manager"
+DATA_DIR="/var/lib/codefreak-manager"
+LOG_FILE="/var/log/codefreak-manager.log"
+
+mkdir -p "$DATA_DIR"
+touch "$LOG_FILE"
+
+require_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    echo "[ERROR] Please run as root."
+    exit 1
+  fi
+}
+
+pause() {
+  read -r -p "Press Enter to continue..."
+}
+
+log_action() {
+  echo "[$(date '+%F %T')] $1" >> "$LOG_FILE"
+}
+
+user_exists() {
+  id "$1" >/dev/null 2>&1
+}
+
+validate_username() {
+  [[ "$1" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]
+}
+
+set_expiry_days() {
+  local username="$1"
+  local days="$2"
+
+  if [[ "$days" == "0" ]]; then
+    chage -E -1 "$username"
+    return
+  fi
+
+  if ! [[ "$days" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] Invalid expiry days."
+    return 1
+  fi
+
+  local expiry_date
+  expiry_date=$(date -d "+$days days" +%F)
+  chage -E "$expiry_date" "$username"
+}
+
+get_expiry_date() {
+  local username="$1"
+  local expiry
+  expiry=$(chage -l "$username" | awk -F': ' '/Account expires/ {print $2}')
+  if [[ "$expiry" == "never" || -z "$expiry" ]]; then
+    echo "Never"
+  else
+    date -d "$expiry" +%F 2>/dev/null || echo "$expiry"
+  fi
+}
+
+ssh_service_name() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
+    echo "ssh"
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+    echo "sshd"
+  else
+    echo ""
+  fi
+}
+
+create_account() {
+  clear
+  echo "=== Create Account ==="
+
+  local username password days
+  read -r -p "Username: " username
+  read -r -s -p "Password: " password
+  echo
+  read -r -p "Expiry in days (0 = no expiry): " days
+
+  if ! validate_username "$username"; then
+    echo "[ERROR] Invalid username."
+    pause
+    return
+  fi
+
+  if user_exists "$username"; then
+    echo "[ERROR] User already exists."
+    pause
+    return
+  fi
+
+  if [[ -z "$password" ]]; then
+    echo "[ERROR] Password cannot be empty."
+    pause
+    return
+  fi
+
+  useradd -m -s /bin/bash "$username"
+  echo "${username}:${password}" | chpasswd
+  set_expiry_days "$username" "$days"
+  passwd -u "$username" >/dev/null 2>&1 || true
+
+  echo "[OK] Account created."
+  echo "Username : $username"
+  echo "Expiry   : $(get_expiry_date "$username")"
+  log_action "Created account: $username expiry=$(get_expiry_date "$username")"
+  pause
+}
+
+bulk_create_accounts() {
+  clear
+  echo "=== Bulk Create Accounts ==="
+  echo "CSV format: username,password,days"
+  echo "Example: test1,Pass123,30"
+  echo
+
+  local csv_file
+  read -r -p "CSV file path: " csv_file
+
+  if [[ ! -f "$csv_file" ]]; then
+    echo "[ERROR] File not found."
+    pause
+    return
+  fi
+
+  local created=0 skipped=0 failed=0 line_no=0
+
+  while IFS=, read -r raw_user raw_pass raw_days || [[ -n "${raw_user:-}" ]]; do
+    line_no=$((line_no + 1))
+    local username password days
+    username="$(echo "${raw_user:-}" | xargs)"
+    password="$(echo "${raw_pass:-}" | xargs)"
+    days="$(echo "${raw_days:-0}" | xargs)"
+
+    [[ -z "$username" ]] && continue
+    if [[ "$username" == "username" && "$password" == "password" ]]; then
+      continue
+    fi
+
+    if ! validate_username "$username"; then
+      echo "[SKIP] Line $line_no invalid username: $username"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if user_exists "$username"; then
+      echo "[SKIP] User exists: $username"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if [[ -z "$password" ]]; then
+      echo "[SKIP] Empty password: $username"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    if useradd -m -s /bin/bash "$username"; then
+      echo "${username}:${password}" | chpasswd
+      set_expiry_days "$username" "$days"
+      passwd -u "$username" >/dev/null 2>&1 || true
+      echo "[OK] Created: $username"
+      log_action "Bulk created account: $username expiry=$(get_expiry_date "$username")"
+      created=$((created + 1))
+    else
+      echo "[FAIL] Could not create: $username"
+      failed=$((failed + 1))
+    fi
+  done < "$csv_file"
+
+  echo
+  echo "Created: $created"
+  echo "Skipped: $skipped"
+  echo "Failed : $failed"
+  pause
+}
+
+delete_account() {
+  clear
+  echo "=== Delete Account ==="
+
+  local username confirm
+  read -r -p "Username: " username
+
+  if ! user_exists "$username"; then
+    echo "[ERROR] User not found."
+    pause
+    return
+  fi
+
+  read -r -p "Type YES to delete $username: " confirm
+  if [[ "$confirm" != "YES" ]]; then
+    echo "Cancelled."
+    pause
+    return
+  fi
+
+  userdel -r "$username" 2>/dev/null || userdel "$username"
+  echo "[OK] Account deleted."
+  log_action "Deleted account: $username"
+  pause
+}
+
+edit_account() {
+  clear
+  echo "=== Edit Account ==="
+
+  local username new_username new_shell
+  read -r -p "Current username: " username
+
+  if ! user_exists "$username"; then
+    echo "[ERROR] User not found."
+    pause
+    return
+  fi
+
+  read -r -p "New username (blank = keep): " new_username
+  read -r -p "New shell [/bin/bash or /usr/sbin/nologin] (blank = keep): " new_shell
+
+  if [[ -n "$new_username" ]]; then
+    if ! validate_username "$new_username"; then
+      echo "[ERROR] Invalid new username."
+      pause
+      return
+    fi
+    if user_exists "$new_username"; then
+      echo "[ERROR] New username already exists."
+      pause
+      return
+    fi
+    usermod -l "$new_username" -d "/home/$new_username" -m "$username"
+    log_action "Renamed account: $username -> $new_username"
+    username="$new_username"
+  fi
+
+  if [[ -n "$new_shell" ]]; then
+    usermod -s "$new_shell" "$username"
+    log_action "Changed shell for: $username to $new_shell"
+  fi
+
+  echo "[OK] Account updated."
+  pause
+}
+
+list_accounts() {
+  clear
+  echo "=== List Account ==="
+  printf "%-20s %-8s %-15s %-20s\n" "USERNAME" "UID" "STATUS" "EXPIRY"
+  printf "%-20s %-8s %-15s %-20s\n" "--------" "---" "------" "------"
+
+  awk -F: '$3 >= 1000 && $1 != "nobody" {print $1 ":" $3}' /etc/passwd | while IFS=: read -r username uid; do
+    status="Active"
+    if passwd -S "$username" 2>/dev/null | awk '{print $2}' | grep -q '^L$'; then
+      status="Locked"
+    fi
+    printf "%-20s %-8s %-15s %-20s\n" "$username" "$uid" "$status" "$(get_expiry_date "$username")"
+  done
+
+  pause
+}
+
+extend_account() {
+  clear
+  echo "=== Extend Account ==="
+
+  local username days current_expiry new_expiry
+  read -r -p "Username: " username
+  read -r -p "Add days: " days
+
+  if ! user_exists "$username"; then
+    echo "[ERROR] User not found."
+    pause
+    return
+  fi
+
+  if ! [[ "$days" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] Days must be a number."
+    pause
+    return
+  fi
+
+  current_expiry=$(get_expiry_date "$username")
+
+  if [[ "$current_expiry" == "Never" ]]; then
+    new_expiry=$(date -d "+$days days" +%F)
+  else
+    new_expiry=$(date -d "$current_expiry +$days days" +%F)
+  fi
+
+  chage -E "$new_expiry" "$username"
+  echo "[OK] Extended until $new_expiry"
+  log_action "Extended account: $username until $new_expiry"
+  pause
+}
+
+change_password() {
+  clear
+  echo "=== Change Password ==="
+
+  local username password
+  read -r -p "Username: " username
+
+  if ! user_exists "$username"; then
+    echo "[ERROR] User not found."
+    pause
+    return
+  fi
+
+  read -r -s -p "New password: " password
+  echo
+
+  if [[ -z "$password" ]]; then
+    echo "[ERROR] Password cannot be empty."
+    pause
+    return
+  fi
+
+  echo "${username}:${password}" | chpasswd
+  echo "[OK] Password changed."
+  log_action "Changed password for: $username"
+  pause
+}
+
+restart_ssh() {
+  clear
+  echo "=== Restart SSH ==="
+
+  local svc
+  svc=$(ssh_service_name)
+  if [[ -z "$svc" ]]; then
+    echo "[ERROR] SSH service not found."
+    pause
+    return
+  fi
+
+  systemctl restart "$svc"
+  echo "[OK] SSH restarted."
+  log_action "Restarted SSH service: $svc"
+  pause
+}
+
+reboot_vps() {
+  clear
+  echo "=== Reboot VPS ==="
+  local confirm
+  read -r -p "Type REBOOT to continue: " confirm
+
+  if [[ "$confirm" == "REBOOT" ]]; then
+    log_action "VPS reboot requested"
+    reboot
+  else
+    echo "Cancelled."
+    pause
+  fi
+}
+
+uninstall_manager() {
+  clear
+  echo "=== Uninstall SSH Manager ==="
+  local confirm
+  read -r -p "Type UNINSTALL to continue: " confirm
+
+  if [[ "$confirm" != "UNINSTALL" ]]; then
+    echo "Cancelled."
+    pause
+    return
+  fi
+
+  systemctl disable --now codefreak-manager.service 2>/dev/null || true
+  rm -f /etc/systemd/system/codefreak-manager.service
+  rm -f /usr/local/bin/codefreak-manager
+  systemctl daemon-reload
+
+  echo "[OK] CodeFreak SSH Manager uninstalled."
+  pause
+  exit 0
+}
+
+show_menu() {
+  clear
+  echo "=============================="
+  echo "     CodeFreak SSH Manager"
+  echo "=============================="
+  echo "1. Create Account"
+  echo "2. Bulk Create Account"
+  echo "3. Delete Account"
+  echo "4. Edit Account"
+  echo "5. List Account"
+  echo "6. Extend Account"
+  echo "7. Change Password"
+  echo "8. Restart SSH"
+  echo "9. Reboot VPS"
+  echo "10. Uninstall SSH Manager"
+  echo "0. Exit"
+  echo "=============================="
+}
+
+main() {
+  require_root
+
+  while true; do
+    show_menu
+    read -r -p "Select option: " choice
+    case "$choice" in
+      1) create_account ;;
+      2) bulk_create_accounts ;;
+      3) delete_account ;;
+      4) edit_account ;;
+      5) list_accounts ;;
+      6) extend_account ;;
+      7) change_password ;;
+      8) restart_ssh ;;
+      9) reboot_vps ;;
+      10) uninstall_manager ;;
+      0) exit 0 ;;
+      *) echo "Invalid option."; pause ;;
+    esac
+  done
+}
+
+main "$@"
