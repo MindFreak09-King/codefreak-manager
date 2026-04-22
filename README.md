@@ -15,19 +15,10 @@ Simple SSH Manager for VPS with expiry system and bulk account support.
 - Reboot VPS
 - Uninstall SSH Manager
 
-## Installation
-
-```bash
-git clone https://github.com/MindFreak09-King/codefreak-manager.git
-cd codefreak-manager
-chmod +x codefreak-manager install-codefreak.sh
-sudo ./install-codefreak.sh
-```
-
 ## Quick Install
 
 ```bash
-curl -fL "https://raw.githubusercontent.com/MindFreak09-King/codefreak-manager/refs/heads/main/installer.sh" -o installer.sh
+curl -fL "https://raw.githubusercontent.com/MindFreak09-King/codefreak-manager/refs/heads/main/install-codefreak.sh" -o installer.sh
 chmod +x installer.sh
 ./installer.sh
 
