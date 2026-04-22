@@ -27,7 +27,10 @@ sudo ./install-codefreak.sh
 ## Quick Install
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/MindFreak09-King/codefreak-manager/main/install-codefreak.sh)
+curl -fL "https://raw.githubusercontent.com/MindFreak09-King/codefreak-manager/refs/heads/main/installer.sh" -o installer.sh
+chmod +x installer.sh
+./installer.sh
+
 ```
 
 ## Usage
